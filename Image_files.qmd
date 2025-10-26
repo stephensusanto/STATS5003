@@ -1,0 +1,1208 @@
+---
+title: "NSW Car Crash Severity Analysis"
+subtitle: ""
+author: 
+  - name: "Angela Sajee"
+  - name: "Hyungjin Kim"
+  - name: "Minji Kim"
+  - name: "Rinta Toyoda"
+  - name: "Stephen Susanto"
+format: 
+  revealjs:
+    theme: sky
+    slide-number: true
+    transition: fade
+---
+
+```{r, message = FALSE, warning = FALSE}
+# list of library
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(rnaturalearth)
+library(sf)
+library(tidyr)
+library(scales)
+library(GGally)
+library(forcats)
+library(patchwork)
+library(rlang)
+library(caret)
+library(knitr) 
+library(corrplot)
+library(shiny)
+library(stringr)
+library(devtools)
+library(plotly)
+library(gridExtra)
+library(kableExtra)
+library(rpart)
+library(caret)
+library(xgboost)
+library(patchwork)
+library(shapviz)
+library(lightgbm)
+library(yardstick)
+library(ranger)
+library(Matrix)
+
+# ------------ Check the overall structure of the dataset ---------------#
+df_info <- function(df) {
+  cat("<class 'data.frame'>\n")
+  cat("RangeIndex:", nrow(df), "entries, 0 to", nrow(df)-1, "\n")
+  cat("Data columns (total", ncol(df), "columns):\n")
+  cat("#   Column                        Non-Null Count  Dtype\n")
+  cat("--- ------                        ---------------  -----\n")
+  
+  for(i in 1:ncol(df)) {
+    non_null_count <- sum(!is.na(df[[i]]))
+    dtype <- class(df[[i]])[1]
+    col_name <- names(df)[i]
+    
+    cat(sprintf("%-3d %-30s %-15s %s\n", 
+                i-1,  # 0-based index
+                col_name,
+                paste(format(non_null_count, big.mark = ","), "non-null"),
+                dtype))
+  }
+  
+  # Data type summary
+  cat("\nDtypes:\n")
+  dtypes <- sapply(df, function(x) class(x)[1])
+  dtype_counts <- table(dtypes)
+  for(i in 1:length(dtype_counts)) {
+    cat(names(dtype_counts)[i], "(", dtype_counts[i], "), ", sep="")
+  }
+  cat("\n")
+  
+  cat("Memory usage:", format(object.size(df), units = "MB"), "\n")
+}
+
+
+# ------------ Check percentage of null values ---------------#
+show_null_data <- function(data) {
+  if ("sf" %in% class(data)) {
+    data <- sf::st_drop_geometry(data)
+  }
+  
+  null_count <- sapply(data, function(x) sum(is.na(x)))
+  null_percent <- round(null_count / nrow(data) * 100, 1)
+  
+  # Build summary dataframe
+  null_summary <- data.frame(
+    Column = names(data),
+    Null_Count = null_count,
+    Null_Percent = null_percent,
+    row.names = NULL
+  )
+  
+  
+  # Sort by Null_Count descending
+  null_summary <- null_summary[order(-null_summary$Null_Count), ]
+  
+  return(null_summary)
+}
+
+# ----------- Remove Nulls based on threshold ---------------#
+remove_high_nulls <- function(data, threshold = 50) {
+  null_summary <- show_null_data(data)
+  
+  keep_cols <- null_summary$Column[null_summary$Null_Percent <= threshold]
+  
+  cleaned_data <- data[, keep_cols, drop = FALSE]
+  return(cleaned_data)
+}
+
+
+# ----------- Remove Get Mode of Column ---------------#
+get_mode <- function(x) {
+  ux <- na.omit(unique(x))       
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+
+# -----------Convert column from numerical to categorical and categorical to numerical ------- #
+convert_columns <- function(data, num_to_cat = NULL, cat_to_num = NULL) {
+  # Copy data to avoid overwriting
+  df <- data
+  
+  if (!is.null(num_to_cat)) {
+    for (col in num_to_cat) {
+      if (col %in% names(df)) {
+        df[[col]] <- as.factor(df[[col]])
+      } else {
+        warning(paste("Column", col, "not found in dataset"))
+      }
+    }
+  }
+  
+  if (!is.null(cat_to_num)) {
+    for (col in cat_to_num) {
+      if (col %in% names(df)) {
+        f <- factor(df[[col]], exclude = NULL) 
+        df[[col]] <- as.integer(f) - 1
+      } else {
+        warning(paste("Column", col, "not found in dataset"))
+      }
+    }
+  }
+  
+  return(as.data.frame(df))  
+}
+
+# ----------- remove bad rows based on 5 columns has specific value --------- #
+remove_bad_rows <- function(df, threshold = 5) {
+  df %>%
+    filter(rowSums(
+      is.na(.) | . == "Unknown" | . == "None"
+    ) <= 5)
+}
+
+# ----------- replaced values --------------------#
+replace_values <- function(df, column_name, value_if_exists, value_if_na) {
+  df[[column_name]] <- ifelse(
+    !is.na(df[[column_name]]),   # If value exists
+    value_if_exists,             # Replace with this
+    value_if_na                  # If NA, replace with this
+  )
+  return(df)
+}
+
+```
+
+```{r, results='hide'}
+original_df <- read_excel("nsw_road_crash_data_2019-2023_crash.xlsx")
+
+# Identify numeric columns
+numeric_cols <- sapply(original_df, is.numeric)
+
+# Identify categorical columns
+categorical_cols <- sapply(original_df, function(x) is.factor(x) | is.character(x))
+
+# Count
+num_numeric <- sum(numeric_cols)
+num_categorical <- sum(categorical_cols)
+```
+
+```{r}
+aus <- ne_states(country = "Australia", returnclass = "sf")
+
+nsw <- aus[aus$name == "New South Wales", ]
+
+# Convert crash data to sf points
+geo_location <- st_as_sf(original_df, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Keep only points within NSW polygon
+geo_location_polygon <- geo_location[st_within(geo_location, nsw, sparse = FALSE), ]
+
+```
+
+```{r, results='hide'}
+# ----------- Remove columns that have more than 50% of missing values ------------- #
+filtered_null_df <- remove_high_nulls(original_df)
+
+# --------- Remove columns that have high correlation ------------ #
+removed_coll_df <- filtered_null_df %>%
+  select(-`Reporting year`, -`DCA - code`)
+
+
+# --------- numerical variable that will be converted to categorical ---------- #
+list_column_numerical = c("Year of crash", "Route no.", "RUM - code", "Crash ID")
+converted_df_missing_values = convert_columns(data = removed_coll_df, num_to_cat = list_column_numerical)
+
+
+# ---------- Replace values of Route No ---------- #
+# Replace to highway or not_highway based on whether there is a value or not
+df_clean_route = replace_values(converted_df_missing_values, "Route no.", value_if_exists = "Highway", value_if_na = "Not Highway")
+
+# ---------- Replace values of Other TU type ----------- #
+# Replace to true or false based on whether there is a value or not
+df_clean_other = replace_values(df_clean_route, "Other TU type", value_if_exists = "Yes", value_if_na = "No")
+
+
+# ---------- Delete unreliable rows based on 5 columns with 5 unknown values threshold -----------------#
+filtered_null_df <- remove_bad_rows(df_clean_other)
+
+
+# ------------------------Filtering NSW Map -------------------- #
+# Convert crash data to sf points
+crash_sf <- st_as_sf(filtered_null_df, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Keep only points within NSW polygon
+crash_nsw_polygon <- crash_sf[st_within(crash_sf, nsw, sparse = FALSE), ]
+
+
+nsw_filtered_df <- as.data.frame(crash_nsw_polygon)
+
+
+# ----------------- Filtered Out Data ----------------- #
+# filtered out year less than 2018
+crash_df <- nsw_filtered_df %>%
+  filter(`Year of crash` != 2018)
+
+# filtered distance more than 10k
+crash_df <- crash_df[crash_df$Distance < 10000, ]
+
+
+# ----------------- Serious Injury and Fatal become one ---------------#
+crash_df$Severity_combined <- ifelse(
+  crash_df$`Degree of crash - detailed` %in% c("Fatal", "Serious Injury"),
+  "Severe Injury or Fatal",                   
+  crash_df$`Degree of crash - detailed`       
+)
+
+crash_df <- crash_df %>%
+  mutate(
+    Time_of_day = case_when(
+      `Two-hour intervals` %in% c("04:00 - 05:59", "02:00 - 03:59") ~ "Dawn",
+      `Two-hour intervals` %in% c("08:00 - 09:59", "10:00 - 11:59",  "06:00 - 07:59") ~ "Morning",
+      `Two-hour intervals` %in% c("12:00 - 13:59", "14:00 - 15:59") ~ "Afternoon",
+      `Two-hour intervals` %in% c("18:00 - 19:59", "16:00 - 17:59", "20:00 - 21:59") ~ "Evening",
+      `Two-hour intervals` %in% c("22:00 - Midnight", "00:01 - 01:59") ~ "Night",
+      `Two-hour intervals` == "Unknown" ~ "Unknown",
+      TRUE ~ "Unknown"
+    )
+  )
+
+converted_df = crash_df
+```
+
+## Project Topic
+
+Project: NSW road crash severity analysis
+
+> how environmental and behavioural factors help us predict severity of road crashes in NSW machine learning approach to classify crashes into different levels - no casualty, minor injury, moderate injury, and severe or fatal evaluate how accurate the models are, which predictors are impactful connecting technical results to real-world policy outcomes
+
+# Research Question
+
+
+## Research Question
+
+> "To what extent can environmental features accurately classify the severity of the car crash, and which variables most significantly influence these patterns?"
+
+## Research Question
+
+-   we are interested in variables that have the greatest influence on those severity patterns.
+-   we built a multi-class classification model to categorize crashes into four severity levels
+-   identify key factors that influence crash outcomes so the insights can support data-driven safety improvements for community
+
+
+# Why it Matters?
+
+## Road Safety and Infrastructure
+
+```{r  fig.width=13, fig.height=7, fig.align='center'}
+
+# Australia map
+aus <- ne_countries(scale = "large", country = "Australia", returnclass = "sf")
+
+# Plot
+ggplot_map <- ggplot() +
+  geom_sf(data = aus, fill = "lightgray", color = "white") +
+  geom_point(
+    data = converted_df, 
+    aes(x = Longitude, y = Latitude, color = Severity_combined), 
+    size = 3,        # increase marker size
+    alpha = 0.8
+  ) +
+  coord_sf(xlim = c(141, 154), ylim = c(-38, -28), expand = FALSE) +  # NSW bounds
+  theme_minimal(base_size = 12) +  # increase base font size
+  labs(
+    title = "Crash Locations in NSW",
+    x = "Longitude", 
+    y = "Latitude", 
+    color = "Crash Severity"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+ggplot_map
+
+```
+
+## Sustainable Mobility
+
+```{r}
+trend <- converted_df %>%
+  group_by(`Year of crash`, Severity_combined) %>%
+  summarise(count = n(), .groups = 'drop')
+
+ggplot(trend, aes(x = `Year of crash`, y = count, color = Severity_combined, group = Severity_combined)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Crash Trend by Severity Over Years",
+    x = "Year",
+    y = "Number of Crashes",
+    color = "Severity"
+  )
+#TODO: put variance in the line plot
+
+```
+
+## Data-driven decision-making
+
+```{r}
+ggplot(converted_df, aes(x = Weather, fill = Severity_combined)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("grey70", "gold", "orange", "red")) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Crash Severity by Weather Condition",
+       x = "Weather Condition", y = "Proportion of Crashes", fill = "Severity") +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+# switch the weather and crash severity
+```
+
+## Safer infrastructure
+
+```{r}
+ggplot(converted_df, aes(x = `Natural lighting`, fill = Severity_combined)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("grey70", "gold", "orange", "red")) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Crash Severity by Lighting Condition",
+       x = "Lighting Condition", y = "Proportion of Crashes", fill = "Severity") +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+## How to process the data?
+
+-   Removing columns/rows that might cause problems
+-   Remove Data Point That not in the average area
+-   Handling inconsistent datatype
+-   Handle Class Imbalance
+
+
+
+## What Does Your Data Look Like?
+
+## What model(s) are you using? Why?
+
+```{r}
+# ---------------------
+# --- Demo controls ---
+#----------------------
+ADD_NOISY_FEATURES <- TRUE
+N_NOISY_DIMS       <- 12
+NOISE_SD           <- 1.0
+
+FLIP_LABEL_RATE    <- 0.10
+
+FIX_K_FOR_KNN      <- TRUE
+K_FIXED            <- 45
+
+GRID_POINTS        <- 300
+PADDING            <- 0.8
+```
+
+```{r}
+# -----------------------------------------
+# ------ Data Set Generator ---------------
+# -----------------------------------------
+
+# ---- sklearn-like dataset generators ----
+make_circles <- function(n_samples = 1000, factor = 0.5, noise = 0.05) {
+  n1 <- n_samples %/% 2; n2 <- n_samples - n1
+  th1 <- runif(n1, 0, 2*pi); th2 <- runif(n2, 0, 2*pi)
+  R_outer <- 1; R_inner <- factor
+  x1 <- cbind(R_outer*cos(th1), R_outer*sin(th1))
+  x2 <- cbind(R_inner*cos(th2), R_inner*sin(th2))
+  X  <- rbind(x1, x2) + matrix(rnorm(2*n_samples, sd=noise), ncol=2)
+  y  <- factor(c(rep(0, n1), rep(1, n2)))
+  data.frame(x1=X[,1], x2=X[,2], y=y)
+}
+
+make_moons <- function(n_samples = 1000, noise = 0.1) {
+  n1 <- n_samples %/% 2; n2 <- n_samples - n1
+  t1 <- runif(n1, 0, pi); t2 <- runif(n2, 0, pi)
+  X  <- rbind(cbind(cos(t1), sin(t1)),
+              cbind(1 - cos(t2), -sin(t2) + 0.5)) +
+        matrix(rnorm(2*n_samples, sd=noise), ncol=2)
+  y  <- factor(c(rep(0, n1), rep(1, n2)))
+  data.frame(x1=X[,1], x2=X[,2], y=y)
+}
+
+make_blobs <- function(n_samples = 1000, centers = list(c(-5,-5), c(5,5)), cluster_std = 2.0) {
+  n1 <- n_samples %/% 2; n2 <- n_samples - n1
+  c1 <- matrix(rnorm(2*n1, sd=cluster_std), ncol=2) + matrix(rep(centers[[1]], each=n1), ncol=2, byrow=TRUE)
+  c2 <- matrix(rnorm(2*n2, sd=cluster_std), ncol=2) + matrix(rep(centers[[2]], each=n2), ncol=2, byrow=TRUE)
+  X  <- rbind(c1, c2)
+  y  <- factor(c(rep(0, n1), rep(1, n2)))
+  data.frame(x1=X[,1], x2=X[,2], y=y)
+}
+
+# Two-cluster-per-class 2D classification
+make_classification2 <- function(n_samples=1000, seed=42) {
+  set.seed(seed)
+  n <- n_samples; n_per <- n %/% 4
+  m00 <- c(-2.5, -2); m01 <- c( 2.5,  2)
+  m10 <- c(-2.5,  2); m11 <- c( 2.5, -2)
+  samp <- function(n, meanx, sd=1) cbind(rnorm(n, meanx[1], sd), rnorm(n, meanx[2], sd))
+  X <- rbind(samp(n_per, m00), samp(n_per, m01), samp(n_per, m10), samp(n_per, m11))
+  y <- factor(c(rep(0, 2*n_per), rep(1, 2*n_per)))
+  data.frame(x1=X[,1], x2=X[,2], y=y)
+}
+
+# Extra sklearn-style "make_classification" analog (messier boundary)
+make_classification_extra <- function(n_samples=1000, seed=42) {
+  set.seed(seed)
+  n1 <- n_samples %/% 2
+  n2 <- n_samples - n1
+  x1 <- rnorm(n1, mean=-2, sd=2)
+  x2 <- 0.5*x1 + rnorm(n1, mean=0, sd=2)
+  X0 <- cbind(x1, x2)
+  x1b <- rnorm(n2, mean=2, sd=2)
+  x2b <- -0.8*x1b + rnorm(n2, mean=0, sd=2)
+  X1 <- cbind(x1b, x2b)
+  X <- rbind(X0, X1)
+  y <- factor(c(rep(0, n1), rep(1, n2)))
+  data.frame(x1=X[,1], x2=X[,2], y=y)
+}
+
+# Create datasets
+datasets <- list(
+  "Circles"            = make_circles(n_samples=1000, factor=0.5, noise=0.05),
+  "Moons"              = make_moons(n_samples=1000, noise=0.10),
+  "Blobs"              = make_blobs(n_samples=1000, centers=list(c(-5,-5), c(5,5)), cluster_std=2.0),
+  "Multiple Blobs"     = make_classification2(n_samples=1000),
+  "Noisy Data"         = make_classification_extra(n_samples=1000)
+)
+```
+
+```{r}
+# -----------------------------------------
+# ---------- Noise Features.---------------
+# -----------------------------------------
+add_noise_features <- function(df, p = 8, sd = 1) {
+  if (p <= 0) return(df)
+  Z <- replicate(p, rnorm(nrow(df), sd=sd))
+  Z <- as.data.frame(Z); names(Z) <- paste0("z", seq_len(p))
+  cbind(df, Z)
+}
+
+flip_labels <- function(df, rate = 0.1) {
+  if (rate <= 0) return(df)
+  n <- nrow(df); k <- ceiling(n*rate)
+  ix <- sample.int(n, k)
+  yy <- as.character(df$y)
+  yy[ix] <- ifelse(yy[ix] == "0", "1", "0")
+  df$y <- factor(yy, levels=c("0","1"))
+  df
+}
+
+augment_dataset <- function(df) {
+  if (ADD_NOISY_FEATURES) df <- add_noise_features(df, p=N_NOISY_DIMS, sd=NOISE_SD)
+  if (FLIP_LABEL_RATE  > 0) df <- flip_labels(df, rate=FLIP_LABEL_RATE)
+  df
+}
+
+datasets <- lapply(datasets, augment_dataset)
+```
+
+
+```{r}
+# -----------------------------------------
+# ---------- Plot Helpers -----------------
+# -----------------------------------------
+
+make_grid <- function(df, padding=PADDING, n=GRID_POINTS) {
+  xr <- range(df$x1); yr <- range(df$x2)
+  G  <- expand.grid(x1 = seq(xr[1]-padding, xr[2]+padding, length.out=n),
+                    x2 = seq(yr[1]-padding, yr[2]+padding, length.out=n))
+  extra <- setdiff(names(df), c("x1","x2","y"))
+  for (c in extra) G[[c]] <- 0
+  G
+}
+
+plot_decision <- function(df, grid_df, grid_pred, title) {
+  ggplot() +
+    geom_raster(data = cbind(grid_df, class = as.factor(grid_pred)),
+                aes(x = x1, y = x2, fill = class), alpha = 0.35) +
+    geom_point(data = df, aes(x = x1, y = x2, color = y), size = 1.2) +
+    scale_fill_manual(values = c("#c6dbef", "#fdd0a2"), name = "Predicted") +
+    scale_color_manual(values = c("#08519c", "#a63603"), name = "True") +
+    guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+    coord_equal() +
+    labs(title = title, x = "x1", y = "x2") +
+    theme_minimal(base_size = 10)
+}
+```
+
+```{r}
+# -----------------------------------------
+# ---------- Model Definition -------------
+# -----------------------------------------
+
+fit_knn <- function(df) {
+  if (FIX_K_FOR_KNN) {
+    caret::train(y ~ ., data=df, method="knn",
+                 trControl=caret::trainControl(method="none"),
+                 preProcess=c("center","scale"),
+                 tuneGrid=data.frame(k = K_FIXED))
+  } else {
+    caret::train(y ~ ., data=df, method="knn",
+                 trControl=caret::trainControl(method="cv", number=5),
+                 preProcess=c("center","scale"),
+                 tuneLength=5)
+  }
+}
+predict_knn <- function(model, newdata) as.character(predict(model, newdata))
+
+fit_dt <- function(df) rpart::rpart(y ~ ., data=df, method="class")
+predict_dt <- function(model, newdata) {
+  pr <- predict(model, newdata, type="prob")[,2]
+  ifelse(pr > 0.5, "1", "0")
+}
+
+fit_rf <- function(df) {
+  x <- df[, setdiff(names(df), "y"), drop=FALSE]
+  y <- df$y
+  ranger::ranger(x = x, y = y, num.trees = 300, probability = FALSE)
+}
+predict_rf <- function(model, newdata) {
+  as.character(predict(model, newdata[, setdiff(names(newdata),"y"), drop=FALSE])$predictions)
+}
+
+fit_xgb <- function(df) {
+  X <- as.matrix(df[, setdiff(names(df),"y"), drop=FALSE])
+  y <- as.numeric(df$y) - 1
+  dtrain <- xgb.DMatrix(X, label = y)
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.2,
+    subsample = 0.9,
+    colsample_bytree = 0.9
+  )
+  xgb.train(params = params, data = dtrain, nrounds = 160, verbose = 0)
+}
+predict_xgb <- function(model, newdata) {
+  X <- as.matrix(newdata[, setdiff(names(newdata),"y"), drop=FALSE])
+  ifelse(predict(model, X) > 0.5, "1", "0")
+}
+
+fit_lgb <- function(df) {
+  X <- as.matrix(df[, setdiff(names(df),"y"), drop=FALSE])
+  y <- as.numeric(df$y) - 1
+  dtrain <- lightgbm::lgb.Dataset(data = X, label = y)
+  params <- list(
+    objective = "binary",
+    metric = "binary_logloss",
+    num_leaves = 31,
+    learning_rate = 0.1,
+    feature_fraction = 0.9,
+    bagging_fraction = 0.9,
+    bagging_freq = 1,
+    min_data_in_leaf = 10
+  )
+  lightgbm::lgb.train(params = params, data = dtrain, nrounds = 220, verbose = -1)
+}
+predict_lgb <- function(model, newdata) {
+  X <- as.matrix(newdata[, setdiff(names(newdata),"y"), drop=FALSE])
+  ifelse(predict(model, X) > 0.5, "1", "0")
+}
+```
+
+
+```{r, fig.width=10, fig.height=8, message=FALSE, warning=FALSE}
+# -----------------------------------------
+# ---------- Train & Plot  ----------------
+# -----------------------------------------
+
+
+# Helper to prettify titles (your dataset names are already clean)
+pretty_ds_name <- function(x) x
+
+models <- list(
+  list(name="KNN",           fit=fit_knn, pred=predict_knn),
+  list(name="Decision Tree", fit=fit_dt,  pred=predict_dt),
+  list(name="Random Forest", fit=fit_rf,  pred=predict_rf),
+  list(name="XGBoost",       fit=fit_xgb, pred=predict_xgb),
+  list(name="LightGBM",      fit=fit_lgb, pred=predict_lgb)
+)
+
+for (dname in names(datasets)) {
+  df   <- datasets[[dname]]
+  grid <- make_grid(df)
+
+  ds_plots <- list()
+  for (m in models) {
+    mdl  <- m$fit(df)                 # LightGBM is guaranteed to exist now
+    yhat <- m$pred(mdl, grid)
+    ds_plots[[length(ds_plots) + 1]] <- plot_decision(df, grid, yhat, paste0(m$name))
+  }
+
+  title_txt <- paste0(pretty_ds_name(dname),
+                      ": KNN, Decision Tree, Random Forest, XGBoost, LightGBM")
+
+  print(
+    patchwork::wrap_plots(ds_plots, ncol = 2) +
+      patchwork::plot_annotation(title = title_txt)
+  )
+}
+```
+
+
+# Key Results and Visuals
+
+```{r}
+# --------------------------Formatting Speed Limit By Splitting Training and Test set ----------#
+
+set.seed(0) 
+train_index <- createDataPartition(converted_df$`Degree of crash - detailed`, p = 0.8, list = FALSE)
+
+train_df <- converted_df[train_index, ]
+test_df  <- converted_df[-train_index, ]
+
+# get mode of speed limit based on the location to impute Unknown values
+train_df <- train_df %>%
+  group_by(`Street of crash`) %>%
+  mutate(`Speed limit` = ifelse(
+    is.na(`Speed limit`) | `Speed limit` == "",
+    get_mode(`Speed limit`),  # replace Unknown with mode for that street
+    `Speed limit`
+  )) %>%
+  ungroup()
+
+```
+
+
+```{r}
+# -------------------------------------------------
+# ---------- Setup Global Train DF ----------------
+# -------------------------------------------------
+
+exclude_cols <- c("geometry","Degree of crash","Crash ID", "Degree of crash - detailed", "No. killed", "No. seriously injured", "No. moderately injured", "No. minor-other injured")
+
+df_filtered <- converted_df[, !names(converted_df) %in% exclude_cols]
+
+set.seed(0) 
+train_index <- createDataPartition(df_filtered$Severity_combined, p = 0.8, list = FALSE)
+
+train_df <- df_filtered[train_index, ]
+test_df  <- df_filtered[-train_index, ]
+
+# get mode of speed limit based on the location to impute Unknown values
+train_df <- train_df %>%
+  group_by(`Street of crash`) %>%
+  mutate(`Speed limit` = ifelse(
+    is.na(`Speed limit`) | `Speed limit` == "",
+    get_mode(`Speed limit`),  # replace Unknown with mode for that street
+    `Speed limit`
+  )) %>%
+  ungroup()
+```
+
+
+```{r}
+# -------------------------------------------------
+# ------------------ XG BOOST ---------------------
+# -------------------------------------------------
+# Define severity levels and encode manually
+severity_levels <- c("Non-casualty (towaway)", "Minor/Other Injury", 
+                     "Moderate Injury", "Severe Injury or Fatal")
+
+train_df$Severity_combined <- factor(train_df$Severity_combined, 
+                                        levels = severity_levels)
+test_df$Severity_combined <- factor(test_df$Severity_combined, 
+                                        levels = severity_levels)
+# Map to numeric IDs (0-based for XGBoost)
+label_numeric_train <- as.numeric(train_df$Severity_combined) - 1
+label_numeric_test <- as.numeric(test_df$Severity_combined) - 1
+
+# Separate features and target 
+  X_train_xg  <- train_df%>% select(-Severity_combined)
+  X_test_xg  <- test_df%>% select(-Severity_combined)
+  y_train_xg <- label_numeric_train
+  y_test_xg <- label_numeric_test
+
+
+# Convert categorical features to numeric
+X_train_num <- X_train_xg %>% mutate(across(everything(), ~ as.numeric(as.factor(.))))
+X_test_num  <- X_test_xg  %>% mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+# Create DMatrix 
+dtrain_xg <- xgb.DMatrix(data = as.matrix(X_train_num), label = y_train_xg)
+dtest_xg  <- xgb.DMatrix(data = as.matrix(X_test_num),  label = y_test_xg)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "multi:softprob",
+  eval_metric = "merror",
+  num_class = length(severity_levels),
+  eta = 0.2,
+  max_depth = 5,
+  min_child_weight = 5,
+  subsample = 0.9
+)
+
+# CROSS-VALIDATION to evaluate model performance
+set.seed(123)
+cv_result <- xgb.cv(
+  params = params,
+  data = dtrain_xg,
+  nrounds = 50,
+  nfold = 10,
+  stratified = TRUE,
+  verbose = 0,
+  early_stopping_rounds = 5
+)
+
+
+# Plot test error over boosting rounds
+cv_error_xgboost_plot = ggplot(cv_result$evaluation_log, aes(x = iter, y = test_merror_mean)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "darkred") +
+  labs(
+    title = "Cross-Validation Error over Rounds (XGBoost)",
+    x = "Boosting Round",
+    y = "Mean Test Error"
+  ) +
+  theme_minimal()
+
+
+# Define eval metrics
+.xgb_argmax <- function(pred, num_class) {
+  m <- matrix(pred, ncol = num_class, byrow = TRUE)
+  max.col(m) - 1L
+}
+
+feval_acc <- function(preds, dtrain) {
+  y_true <- xgboost::getinfo(dtrain, "label")
+  K <- length(unique(y_true))
+  y_pred <- .xgb_argmax(preds, K)
+  acc <- mean(y_pred == y_true)
+  list(metric = "acc", value = acc)
+}
+
+feval_f1_weighted <- function(preds, dtrain) {
+  y_true <- xgboost::getinfo(dtrain, "label")
+  K <- length(unique(y_true))
+  y_pred <- .xgb_argmax(preds, K)
+  tab <- table(factor(y_true, levels = 0:(K-1)),
+               factor(y_pred, levels = 0:(K-1)))
+  tp <- diag(tab)
+  fp <- colSums(tab) - tp
+  fn <- rowSums(tab) - tp
+  prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  support <- rowSums(tab)
+  w <- support / sum(support)
+  list(metric = "f1_weighted", value = sum(w * f1))
+}
+
+# Train final model
+best_nrounds <- cv_result$best_iteration  # use optimal round from CV
+
+params_acc <- params
+params_acc$eval_metric <- "merror"
+
+model_acc <- xgboost::xgb.train(
+  params    = params_acc,
+  data      = dtrain_xg,
+  nrounds   = best_nrounds, 
+  watchlist = list(train = dtrain_xg, test = dtest_xg),
+  callbacks = list(xgboost::cb.evaluation.log()),
+  verbose   = 0
+)
+
+elog_acc <- model_acc$evaluation_log
+last_acc <- nrow(elog_acc)
+train_acc_final <- 1 - elog_acc$train_merror[last_acc]
+
+
+params$eval_metric <- NULL # to use the user defined accuracy and f1 score
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain_xg,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain_xg, test = dtest_xg),
+  feval = feval_f1_weighted,
+  maximize = TRUE,
+  callbacks = list(xgboost::cb.evaluation.log()),
+  verbose = 0
+)
+
+# Log best score from the training
+elog <- xgb_model$evaluation_log
+last <- nrow(elog)
+
+train_f1w_final <- elog$train_f1_weighted[last]
+
+cat(sprintf("[FINAL @ %d rounds]\n", best_nrounds))
+cat(sprintf("Train Accuracy:  %.4f | Train F1_weighted: %.4f\n",
+            train_acc_final, train_f1w_final))
+
+
+# Predict and evaluate on test set
+pred_prob <- predict(xgb_model, newdata = dtest_xg)
+pred_matrix <- matrix(pred_prob, ncol = length(severity_levels), byrow = TRUE)
+
+pred_class_numeric <- max.col(pred_matrix) - 1
+pred_class_label <- severity_levels[pred_class_numeric + 1]
+actual_class_label <- severity_levels[y_test_xg + 1]
+
+conf_matrix_xgb <- table(Predicted = pred_class_label, Actual = actual_class_label)
+print(conf_matrix_xgb)
+
+accuracy_xgb <- sum(diag(conf_matrix_xgb)) / sum(conf_matrix_xgb)
+cat("Test Accuracy:", round(accuracy_xgb * 100, 2), "%\n")
+
+# Set level order for Confusion Matrix
+truth_fac <- factor(actual_class_label, levels = severity_levels, ordered = TRUE)
+pred_fac  <- factor(pred_class_label,   levels = severity_levels, ordered = TRUE)
+pred_df <- tibble(truth = truth_fac, estimate = pred_fac)
+
+# Weighted F1
+f1_weighted_xg <- f_meas(pred_df, truth, estimate, estimator = "macro_weighted") %>% dplyr::pull(.estimate)
+cat("Test F1 Score (weighted):", round(f1_weighted_xg * 100, 2), "%\n")
+
+# Plot Confusion Matrix
+conf_df <- as.data.frame(conf_matrix_xgb)
+
+conf_df$Actual <- factor(conf_df$Actual, levels = severity_levels, ordered = TRUE)
+conf_df$Predicted <- factor(conf_df$Predicted, levels = severity_levels, ordered = TRUE)
+
+confusion_matrix_xgboost_plot = ggplot(conf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 6) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix (XGBoost)", x = "Actual Class", y = "Predicted Class") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12, angle = 30, hjust = 1), # rotate and space out x-axis
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 16),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20)       # extra space around plot
+  )
+
+# Compute feature importance from the trained model
+X_train_mat <- as.matrix(X_train_num)
+colnames(X_train_mat) <- make.names(colnames(X_train_num))  # safe names
+
+# Update DMatrix to ensure column names match (if needed)
+dtrain <- xgb.DMatrix(data = X_train_mat, label = y_train_xg)
+
+# Compute feature importance
+importance_matrix <- xgb.importance(feature_names = colnames(X_train_mat), model = xgb_model)
+
+# Plot top 15 features 
+importance_bar_plot = xgb.plot.importance(
+  importance_matrix[1:min(10, nrow(importance_matrix)), ], 
+  main = "Top 10 Important Features (XGBoost)",
+  rel_to_first = TRUE,
+  xlab = "Relative Importance"
+)
+```
+
+
+
+```{r}
+# -------------------------------------------------
+# ---------------- XG BOOST SHAP PLOT -------------
+# -------------------------------------------------
+# Ensure your matrix has column names
+# Do NOT use make.names if you didn't use it during training
+X_train_mat <- as.matrix(X_train_num)
+# Keep original column names
+colnames(X_train_mat) <- colnames(X_train_num)
+
+# For multiclass XGBoost, shapviz needs the class of interest
+shp <- shapviz(xgb_model, X_pred = X_train_mat, X = X_train_mat, type = "prob", which_class = 4)
+
+# Map class numbers to severity labels
+shp$y_levels <- severity_levels
+
+xg_boost_waterfall = sv_waterfall(shp, row_id = 1)
+xg_boost_force = sv_force(shp, row_id = 1)
+
+# For importance plots
+xg_boost_importance_plot = sv_importance(shp, kind = "both")
+
+
+top_feats <- sv_importance(shp, kind = "bar")$feature[1:7]
+for (feat in top_feats) {
+  xg_boost_shap_plot = sv_dependence(shp, v = feat, show_labels = FALSE)
+}
+```
+
+## Confusion Matrix
+```{r}
+confusion_matrix_xgboost_plot
+```
+
+## What features are causing "Severe Injury / Fatal"
+```{r}
+xg_boost_importance_plot
+```
+## Example of how each feature affects the prediction
+```{r}
+# Target Class
+target_label <- "Severe Injury or Fatal"
+target_idx   <- which(severity_levels == target_label)
+
+# 1) Extract the probability of class (severe injury or fatal)
+prob_severe <- pred_matrix[, target_idx]
+
+# 2) Top-5 index
+top_idx <- order(prob_severe, decreasing = TRUE)[seq_len(min(70, length(prob_severe)))]
+
+# 3) Print the top-5 list
+top_tbl <- tibble(
+  row_id             = top_idx,
+  prob_severe_fatal  = round(prob_severe[top_idx], 4),
+  pred_label         = pred_class_label[top_idx],
+  actual_label       = actual_class_label[top_idx]
+)
+
+top_tbl <- top_tbl %>% filter(as.character(pred_label) == as.character(actual_label))
+
+kable(top_tbl, caption = "Highest predicted Severe/Fatal (test)") %>%
+  kable_styling(position = "center", full_width = FALSE)
+
+# Prepare the feature matrix
+X_train_mat <- as.matrix(X_train_num)
+X_test_mat  <- as.matrix(X_test_num)
+
+stopifnot(identical(colnames(X_train_mat), colnames(X_test_mat)))
+
+# For plot, revert to categorical value name
+X_test_display <- X_test_xg[top_idx, colnames(X_test_mat), drop = FALSE]
+
+# Create SHAP for top 5 record
+shp_top <- shapviz(
+  xgb_model,
+  X_pred = X_test_mat[top_idx, , drop = FALSE],
+  X = X_train_mat[top_idx, , drop = FALSE],
+  type = "prob",
+  which_class = target_idx
+)
+
+# Replace the numerical feature value to original categorical value
+stopifnot(nrow(shp_top$S) == nrow(X_test_display))
+stopifnot(identical(colnames(X_test_display), colnames(shp_top$S)))
+shp_top$X <- X_test_display
+
+
+# Individual SHAP plot
+waterfall_plots <- lapply(seq_along(top_idx), function(i) {
+  sv_waterfall(shp_top, row_id = i) +
+    ggtitle("How each feature affects the prediction")
+})
+
+force_plots <- lapply(seq_along(top_idx), function(i) {
+  sv_force(shp_top, row_id = i)
+})
+```
+```{r}
+# print(waterfall_plots[[7]])
+# print(waterfall_plots[[34]])
+print(waterfall_plots[[36]])
+```
+
+
+```{r}
+# -------------------------------------------------
+# ---------------- RANDOM FOREST ------------------
+# -------------------------------------------------
+set.seed(42)
+
+# Sanity checks
+
+stopifnot(exists("train_df"), exists("test_df"))
+stopifnot("Severity_combined" %in% names(train_df), "Severity_combined" %in% names(test_df))
+
+# Use the already processed splits directly
+
+rf_train <- train_df
+rf_test  <- test_df
+
+# Ensure target is factor (no other preprocessing)
+
+rf_train$Severity_combined <- as.factor(rf_train$Severity_combined)
+rf_test$Severity_combined  <- as.factor(rf_test$Severity_combined)
+
+cat("Training set size:", nrow(rf_train), "\n")
+cat("Test set size:", nrow(rf_test), "\n")
+
+# Split predictors and target
+
+predictors_rf <- setdiff(names(rf_train), "Severity_combined")
+x_train_rf <- rf_train[, predictors_rf, drop = FALSE]
+y_train_rf <- rf_train$Severity_combined
+x_test_rf  <- rf_test[,  predictors_rf, drop = FALSE]
+y_test_rf  <- rf_test$Severity_combined
+
+# Optional: class weights from training distribution
+
+class_counts_rf <- table(y_train_rf)
+class_wts_rf <- as.numeric(median(class_counts_rf) / class_counts_rf)
+names(class_wts_rf) <- names(class_counts_rf)
+
+kable(data.frame(
+Class = names(class_counts_rf),
+Train_Count = as.numeric(class_counts_rf),
+Train_Pct = round(100 * prop.table(class_counts_rf), 2)
+), caption = "Class Distribution (Train)") %>%
+kable_styling(position = "center", font_size = 10, full_width = FALSE)
+
+# Train baseline Random Forest
+
+p_rf <- ncol(x_train_rf)
+mtry_val_rf <- max(1, floor(sqrt(p_rf)))
+
+baseline_rf_model <- ranger(
+x = x_train_rf,
+y = y_train_rf,
+num.trees = 300,
+mtry = mtry_val_rf,
+min.node.size = 5,
+sample.fraction = 0.8,
+replace = TRUE,
+classification = TRUE,
+importance = "permutation",
+respect.unordered.factors = "order",
+class.weights = class_wts_rf,
+oob.error = TRUE,
+probability = TRUE
+)
+
+cat("OOB Error Rate:", round(baseline_rf_model$prediction.error * 100, 2), "%\n")
+
+# Evaluate on test set
+
+baseline_pred_prob <- predict(baseline_rf_model, data = x_test_rf)$predictions
+baseline_pred_lab  <- colnames(baseline_pred_prob)[max.col(baseline_pred_prob)]
+baseline_pred_fac  <- factor(baseline_pred_lab, levels = severity_levels)
+
+baseline_cm_rf <- confusionMatrix(baseline_pred_fac, rf_test$Severity_combined, mode = "everything")
+
+# Using yardstick to create table looking performance metrics
+pred_df <- tibble(
+  truth = factor(rf_test$Severity_combined, levels = severity_levels),
+  estimate = factor(baseline_pred_fac, levels = severity_levels)
+)
+
+acc_test <- accuracy(pred_df, truth, estimate) %>% pull(.estimate)
+f1_macro <- f_meas(pred_df, truth, estimate, estimator = "macro") %>% pull(.estimate)
+f1_weight <- f_meas(pred_df, truth, estimate, estimator = "macro_weighted") %>% pull(.estimate)
+
+cat(sprintf("TEST | Acc: %.3f  F1_macro: %.3f  F1_weighted: %.3f\n", acc_test, f1_macro, f1_weight))
+
+# Feature importance (top 30)
+imp_df_rf <- data.frame(
+Feature = names(baseline_rf_model$variable.importance),
+Importance = baseline_rf_model$variable.importance,
+stringsAsFactors = FALSE
+) %>%
+arrange(desc(Importance)) %>%
+mutate(Cumulative_Importance = cumsum(Importance) / sum(Importance),
+Rank = dplyr::row_number())
+
+top_rf <- imp_df_rf %>% dplyr::slice_head(n = 30)
+top_rf$Feature <- factor(top_rf$Feature, levels = rev(top_rf$Feature))
+
+p1_rf <- ggplot(top_rf, aes(x = Feature, y = Importance)) +
+geom_col() +
+coord_flip() +
+labs(title = "Top 30 Most Important Features", x = "Feature", y = "Importance (Gini)") +
+theme_minimal(base_size = 9)
+
+p2_rf <- ggplot(imp_df_rf, aes(x = Rank, y = Cumulative_Importance)) +
+geom_line() +
+geom_hline(yintercept = c(0.8, 0.9, 0.95), linetype = "dashed") +
+labs(title = "Cumulative Feature Importance", x = "Number of Features", y = "Cumulative Importance") +
+theme_minimal(base_size = 9)
+
+p1_rf / p2_rf
+
+# (Optional) Simple final model using top-k features (no extra preprocessing)
+
+best_features_rf <- imp_df_rf$Feature[1:min(30, nrow(imp_df_rf))]
+x_train_best_rf <- x_train_rf[, best_features_rf, drop = FALSE]
+x_test_best_rf  <- x_test_rf[,  best_features_rf, drop = FALSE]
+
+final_rf_model <- ranger(
+x = x_train_best_rf, y = y_train_rf,
+num.trees = 300,
+mtry = max(1, floor(sqrt(length(best_features_rf)))),
+min.node.size = 5,
+sample.fraction = 0.8,
+replace = TRUE,
+classification = TRUE,
+importance = "permutation",
+respect.unordered.factors = "order",
+class.weights = class_wts_rf,
+oob.error = TRUE,
+probability = TRUE
+)
+
+# Final Model Performance
+final_pred_prob <- predict(final_rf_model, data = x_test_best_rf)$predictions
+final_pred_lab  <- colnames(final_pred_prob)[max.col(final_pred_prob)]
+final_pred_fac  <- factor(final_pred_lab, levels = severity_levels)
+
+final_df <- tibble(truth = factor(y_test_rf, levels = severity_levels),
+                   estimate = final_pred_fac)
+acc_final_rf <- accuracy(final_df, truth, estimate) %>% pull(.estimate)
+f1_macro_rf <- f_meas(final_df, truth, estimate, estimator="macro") %>% pull(.estimate)
+f1_weighted_rf <- f_meas(final_df, truth, estimate, estimator="macro_weighted") %>% pull(.estimate)
+
+cat(sprintf("Final TEST | Acc: %.3f  F1_macro: %.3f  F1_weighted: %.3f\n", acc_final_rf, f1_macro_rf, f1_weighted_rf))
+```
+
+## Random Forest
+
+```{r}
+# Feature importance (top 10)
+imp_df_rf <- data.frame(
+Feature = names(final_rf_model$variable.importance),
+Importance = final_rf_model$variable.importance,
+stringsAsFactors = FALSE
+) %>%
+arrange(desc(Importance)) %>%
+mutate(Cumulative_Importance = cumsum(Importance) / sum(Importance),
+Rank = dplyr::row_number())
+
+top10_rf <- imp_df_rf %>% dplyr::slice_head(n = 10)
+top10_rf$Feature <- factor(top10_rf$Feature, levels = rev(top10_rf$Feature))
+
+p1_rf <- ggplot(top10_rf, aes(x = Feature, y = Importance)) +
+geom_col() +
+coord_flip() +
+labs(title = "Top 10 Important Features for Random Forest", x = "Feature", y = "Importance (Permutation)") +
+theme_minimal(base_size = 9)
+
+p1_rf
+```
+
+
+```{r}
+# Tables Model Comparison
+model_comparison <- data.frame(
+  Model = c("XGBoost", "LightGBM", "KNN", "Random Forest", "Decision Tree"),
+  Accuracy = c(48, 33, 27, 44, 44)
+)
+
+# Sort by accuracy (descending)
+model_sorted <- model_comparison %>%
+  arrange(desc(Accuracy))
+
+# Add percentage to Accuracy column name
+model_sorted <- model_sorted %>% rename(`Accuracy (%)` = Accuracy)
+
+print(model_sorted)
+```
+
+## Final Insighs: What have you learned & link back to the research problem
+
