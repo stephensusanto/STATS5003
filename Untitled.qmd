@@ -291,7 +291,13 @@ Project: NSW road crash severity analysis
 
 # Why it Matters?
 
-## Road Safety and Infrastructure
+- Enhance Road Safety
+- Design safer infrastructure
+- Support data-driven decision-making
+- Contribute to sustainable mobility goals
+
+
+## Crash NSW Based on Location
 
 ```{r  fig.width=13, fig.height=7, fig.align='center'}
 
@@ -327,7 +333,7 @@ ggplot_map
 
 ```
 
-## Sustainable Mobility
+## Crash Trend by Severity
 
 ```{r}
 trend <- converted_df %>%
@@ -344,313 +350,47 @@ ggplot(trend, aes(x = `Year of crash`, y = count, color = Severity_combined, gro
     y = "Number of Crashes",
     color = "Severity"
   )
-#TODO: put variance in the line plot
 
 ```
 
-## Data-driven decision-making
-
-```{r}
-ggplot(converted_df, aes(x = Weather, fill = Severity_combined)) +
-  geom_bar(position = "fill") +
-  scale_fill_manual(values = c("grey70", "gold", "orange", "red")) +
-  theme_minimal(base_size = 11) +
-  labs(title = "Crash Severity by Weather Condition",
-       x = "Weather Condition", y = "Proportion of Crashes", fill = "Severity") +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
-# switch the weather and crash severity
-```
-
-## Safer infrastructure
-
-```{r}
-ggplot(converted_df, aes(x = `Natural lighting`, fill = Severity_combined)) +
-  geom_bar(position = "fill") +
-  scale_fill_manual(values = c("grey70", "gold", "orange", "red")) +
-  theme_minimal(base_size = 11) +
-  labs(title = "Crash Severity by Lighting Condition",
-       x = "Lighting Condition", y = "Proportion of Crashes", fill = "Severity") +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
-```
 
 ## How to process the data?
 
--   Removing columns/rows that might cause problems
--   Remove Data Point That not in the average area
--   Handling inconsistent datatype
--   Handle Class Imbalance
+- Data Cleaning
+- Remove outliers
+- Fix data types
+- Balance classes
 
 
+# What Does Your Data Look Like?
+The NSW Car Crash Severity dataset includes crash-level information collected from New South Wales road incidents. Each observation represents a single crash, containing a mix of categorical, numerical, spatial (geometry), and textual variables.
 
 ## What Does Your Data Look Like?
 
+- Crash Characteristics: degree of crash, month, day, time interval, speed limit, alignment, weather, etc.
+
+- Geography: location, urbanisation, school zones.
+
+- Outcomes: number of injuries and fatalities.
+
+- Identifiers: Crash ID, route, street.
+
+- Target: Crash Severity (ordinal factor).
+
+
+# What model(s) are you using? Why?
+
+
 ## What model(s) are you using? Why?
-
 ```{r}
-# ---------------------
-# --- Demo controls ---
-#----------------------
-ADD_NOISY_FEATURES <- TRUE
-N_NOISY_DIMS       <- 12
-NOISE_SD           <- 1.0
-
-FLIP_LABEL_RATE    <- 0.10
-
-FIX_K_FOR_KNN      <- TRUE
-K_FIXED            <- 45
-
-GRID_POINTS        <- 300
-PADDING            <- 0.8
+knitr::include_graphics("decision_boundaries_Moons.png")
 ```
 
+
+## What model(s) are you using? Why?
 ```{r}
-# -----------------------------------------
-# ------ Data Set Generator ---------------
-# -----------------------------------------
-
-# ---- sklearn-like dataset generators ----
-make_circles <- function(n_samples = 1000, factor = 0.5, noise = 0.05) {
-  n1 <- n_samples %/% 2; n2 <- n_samples - n1
-  th1 <- runif(n1, 0, 2*pi); th2 <- runif(n2, 0, 2*pi)
-  R_outer <- 1; R_inner <- factor
-  x1 <- cbind(R_outer*cos(th1), R_outer*sin(th1))
-  x2 <- cbind(R_inner*cos(th2), R_inner*sin(th2))
-  X  <- rbind(x1, x2) + matrix(rnorm(2*n_samples, sd=noise), ncol=2)
-  y  <- factor(c(rep(0, n1), rep(1, n2)))
-  data.frame(x1=X[,1], x2=X[,2], y=y)
-}
-
-make_moons <- function(n_samples = 1000, noise = 0.1) {
-  n1 <- n_samples %/% 2; n2 <- n_samples - n1
-  t1 <- runif(n1, 0, pi); t2 <- runif(n2, 0, pi)
-  X  <- rbind(cbind(cos(t1), sin(t1)),
-              cbind(1 - cos(t2), -sin(t2) + 0.5)) +
-        matrix(rnorm(2*n_samples, sd=noise), ncol=2)
-  y  <- factor(c(rep(0, n1), rep(1, n2)))
-  data.frame(x1=X[,1], x2=X[,2], y=y)
-}
-
-make_blobs <- function(n_samples = 1000, centers = list(c(-5,-5), c(5,5)), cluster_std = 2.0) {
-  n1 <- n_samples %/% 2; n2 <- n_samples - n1
-  c1 <- matrix(rnorm(2*n1, sd=cluster_std), ncol=2) + matrix(rep(centers[[1]], each=n1), ncol=2, byrow=TRUE)
-  c2 <- matrix(rnorm(2*n2, sd=cluster_std), ncol=2) + matrix(rep(centers[[2]], each=n2), ncol=2, byrow=TRUE)
-  X  <- rbind(c1, c2)
-  y  <- factor(c(rep(0, n1), rep(1, n2)))
-  data.frame(x1=X[,1], x2=X[,2], y=y)
-}
-
-# Two-cluster-per-class 2D classification
-make_classification2 <- function(n_samples=1000, seed=42) {
-  set.seed(seed)
-  n <- n_samples; n_per <- n %/% 4
-  m00 <- c(-2.5, -2); m01 <- c( 2.5,  2)
-  m10 <- c(-2.5,  2); m11 <- c( 2.5, -2)
-  samp <- function(n, meanx, sd=1) cbind(rnorm(n, meanx[1], sd), rnorm(n, meanx[2], sd))
-  X <- rbind(samp(n_per, m00), samp(n_per, m01), samp(n_per, m10), samp(n_per, m11))
-  y <- factor(c(rep(0, 2*n_per), rep(1, 2*n_per)))
-  data.frame(x1=X[,1], x2=X[,2], y=y)
-}
-
-# Extra sklearn-style "make_classification" analog (messier boundary)
-make_classification_extra <- function(n_samples=1000, seed=42) {
-  set.seed(seed)
-  n1 <- n_samples %/% 2
-  n2 <- n_samples - n1
-  x1 <- rnorm(n1, mean=-2, sd=2)
-  x2 <- 0.5*x1 + rnorm(n1, mean=0, sd=2)
-  X0 <- cbind(x1, x2)
-  x1b <- rnorm(n2, mean=2, sd=2)
-  x2b <- -0.8*x1b + rnorm(n2, mean=0, sd=2)
-  X1 <- cbind(x1b, x2b)
-  X <- rbind(X0, X1)
-  y <- factor(c(rep(0, n1), rep(1, n2)))
-  data.frame(x1=X[,1], x2=X[,2], y=y)
-}
-
-# Create datasets
-datasets <- list(
-  "Circles"            = make_circles(n_samples=1000, factor=0.5, noise=0.05),
-  "Moons"              = make_moons(n_samples=1000, noise=0.10),
-  "Blobs"              = make_blobs(n_samples=1000, centers=list(c(-5,-5), c(5,5)), cluster_std=2.0),
-  "Multiple Blobs"     = make_classification2(n_samples=1000),
-  "Noisy Data"         = make_classification_extra(n_samples=1000)
-)
+knitr::include_graphics("decision_boundaries_Blobs.png")
 ```
-
-```{r}
-# -----------------------------------------
-# ---------- Noise Features.---------------
-# -----------------------------------------
-add_noise_features <- function(df, p = 8, sd = 1) {
-  if (p <= 0) return(df)
-  Z <- replicate(p, rnorm(nrow(df), sd=sd))
-  Z <- as.data.frame(Z); names(Z) <- paste0("z", seq_len(p))
-  cbind(df, Z)
-}
-
-flip_labels <- function(df, rate = 0.1) {
-  if (rate <= 0) return(df)
-  n <- nrow(df); k <- ceiling(n*rate)
-  ix <- sample.int(n, k)
-  yy <- as.character(df$y)
-  yy[ix] <- ifelse(yy[ix] == "0", "1", "0")
-  df$y <- factor(yy, levels=c("0","1"))
-  df
-}
-
-augment_dataset <- function(df) {
-  if (ADD_NOISY_FEATURES) df <- add_noise_features(df, p=N_NOISY_DIMS, sd=NOISE_SD)
-  if (FLIP_LABEL_RATE  > 0) df <- flip_labels(df, rate=FLIP_LABEL_RATE)
-  df
-}
-
-datasets <- lapply(datasets, augment_dataset)
-```
-
-
-```{r}
-# -----------------------------------------
-# ---------- Plot Helpers -----------------
-# -----------------------------------------
-
-make_grid <- function(df, padding=PADDING, n=GRID_POINTS) {
-  xr <- range(df$x1); yr <- range(df$x2)
-  G  <- expand.grid(x1 = seq(xr[1]-padding, xr[2]+padding, length.out=n),
-                    x2 = seq(yr[1]-padding, yr[2]+padding, length.out=n))
-  extra <- setdiff(names(df), c("x1","x2","y"))
-  for (c in extra) G[[c]] <- 0
-  G
-}
-
-plot_decision <- function(df, grid_df, grid_pred, title) {
-  ggplot() +
-    geom_raster(data = cbind(grid_df, class = as.factor(grid_pred)),
-                aes(x = x1, y = x2, fill = class), alpha = 0.35) +
-    geom_point(data = df, aes(x = x1, y = x2, color = y), size = 1.2) +
-    scale_fill_manual(values = c("#c6dbef", "#fdd0a2"), name = "Predicted") +
-    scale_color_manual(values = c("#08519c", "#a63603"), name = "True") +
-    guides(fill = guide_legend(override.aes = list(alpha = 1))) +
-    coord_equal() +
-    labs(title = title, x = "x1", y = "x2") +
-    theme_minimal(base_size = 10)
-}
-```
-
-```{r}
-# -----------------------------------------
-# ---------- Model Definition -------------
-# -----------------------------------------
-
-fit_knn <- function(df) {
-  if (FIX_K_FOR_KNN) {
-    caret::train(y ~ ., data=df, method="knn",
-                 trControl=caret::trainControl(method="none"),
-                 preProcess=c("center","scale"),
-                 tuneGrid=data.frame(k = K_FIXED))
-  } else {
-    caret::train(y ~ ., data=df, method="knn",
-                 trControl=caret::trainControl(method="cv", number=5),
-                 preProcess=c("center","scale"),
-                 tuneLength=5)
-  }
-}
-predict_knn <- function(model, newdata) as.character(predict(model, newdata))
-
-fit_dt <- function(df) rpart::rpart(y ~ ., data=df, method="class")
-predict_dt <- function(model, newdata) {
-  pr <- predict(model, newdata, type="prob")[,2]
-  ifelse(pr > 0.5, "1", "0")
-}
-
-fit_rf <- function(df) {
-  x <- df[, setdiff(names(df), "y"), drop=FALSE]
-  y <- df$y
-  ranger::ranger(x = x, y = y, num.trees = 300, probability = FALSE)
-}
-predict_rf <- function(model, newdata) {
-  as.character(predict(model, newdata[, setdiff(names(newdata),"y"), drop=FALSE])$predictions)
-}
-
-fit_xgb <- function(df) {
-  X <- as.matrix(df[, setdiff(names(df),"y"), drop=FALSE])
-  y <- as.numeric(df$y) - 1
-  dtrain <- xgb.DMatrix(X, label = y)
-  params <- list(
-    objective = "binary:logistic",
-    eval_metric = "logloss",
-    max_depth = 4,
-    eta = 0.2,
-    subsample = 0.9,
-    colsample_bytree = 0.9
-  )
-  xgb.train(params = params, data = dtrain, nrounds = 160, verbose = 0)
-}
-predict_xgb <- function(model, newdata) {
-  X <- as.matrix(newdata[, setdiff(names(newdata),"y"), drop=FALSE])
-  ifelse(predict(model, X) > 0.5, "1", "0")
-}
-
-fit_lgb <- function(df) {
-  X <- as.matrix(df[, setdiff(names(df),"y"), drop=FALSE])
-  y <- as.numeric(df$y) - 1
-  dtrain <- lightgbm::lgb.Dataset(data = X, label = y)
-  params <- list(
-    objective = "binary",
-    metric = "binary_logloss",
-    num_leaves = 31,
-    learning_rate = 0.1,
-    feature_fraction = 0.9,
-    bagging_fraction = 0.9,
-    bagging_freq = 1,
-    min_data_in_leaf = 10
-  )
-  lightgbm::lgb.train(params = params, data = dtrain, nrounds = 220, verbose = -1)
-}
-predict_lgb <- function(model, newdata) {
-  X <- as.matrix(newdata[, setdiff(names(newdata),"y"), drop=FALSE])
-  ifelse(predict(model, X) > 0.5, "1", "0")
-}
-```
-
-
-```{r, fig.width=10, fig.height=8, message=FALSE, warning=FALSE}
-# -----------------------------------------
-# ---------- Train & Plot  ----------------
-# -----------------------------------------
-
-
-# Helper to prettify titles (your dataset names are already clean)
-pretty_ds_name <- function(x) x
-
-models <- list(
-  list(name="KNN",           fit=fit_knn, pred=predict_knn),
-  list(name="Decision Tree", fit=fit_dt,  pred=predict_dt),
-  list(name="Random Forest", fit=fit_rf,  pred=predict_rf),
-  list(name="XGBoost",       fit=fit_xgb, pred=predict_xgb),
-  list(name="LightGBM",      fit=fit_lgb, pred=predict_lgb)
-)
-
-for (dname in names(datasets)) {
-  df   <- datasets[[dname]]
-  grid <- make_grid(df)
-
-  ds_plots <- list()
-  for (m in models) {
-    mdl  <- m$fit(df)                 # LightGBM is guaranteed to exist now
-    yhat <- m$pred(mdl, grid)
-    ds_plots[[length(ds_plots) + 1]] <- plot_decision(df, grid, yhat, paste0(m$name))
-  }
-
-  title_txt <- paste0(pretty_ds_name(dname),
-                      ": KNN, Decision Tree, Random Forest, XGBoost, LightGBM")
-
-  print(
-    patchwork::wrap_plots(ds_plots, ncol = 2) +
-      patchwork::plot_annotation(title = title_txt)
-  )
-}
-```
-
 
 # Key Results and Visuals
 
@@ -863,6 +603,7 @@ for (feat in top_feats) {
 ## XGBoost
 ```{r}
 xg_boost_importance_plot
+confusion_matrix_xgboost_plot
 ```
 
 
