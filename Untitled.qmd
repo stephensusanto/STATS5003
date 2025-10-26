@@ -380,7 +380,6 @@ The NSW Car Crash Severity dataset includes crash-level information collected fr
 
 # What model(s) are you using? Why?
 
-
 ## What model(s) are you using? Why?
 ```{r}
 knitr::include_graphics("decision_boundaries_Moons.png")
@@ -480,7 +479,9 @@ params <- list(
   eval_metric = "merror",
   num_class = length(severity_levels),
   eta = 0.2,
-  max_depth = 3
+  max_depth = 5,
+  min_child_weight = 5,
+  subsample = 0.9
 )
 
 # CROSS-VALIDATION to evaluate model performance
@@ -488,13 +489,12 @@ set.seed(123)
 cv_result <- xgb.cv(
   params = params,
   data = dtrain_xg,
-  nrounds = 30,
+  nrounds = 50,
   nfold = 10,
   stratified = TRUE,
   verbose = 0,
   early_stopping_rounds = 5
 )
-
 
 
 # Plot test error over boosting rounds
@@ -508,16 +508,81 @@ cv_error_xgboost_plot = ggplot(cv_result$evaluation_log, aes(x = iter, y = test_
   ) +
   theme_minimal()
 
-# Train final model (optional, using all train data)
+
+# Define eval metrics
+.xgb_argmax <- function(pred, num_class) {
+  m <- matrix(pred, ncol = num_class, byrow = TRUE)
+  max.col(m) - 1L
+}
+
+feval_acc <- function(preds, dtrain) {
+  y_true <- xgboost::getinfo(dtrain, "label")
+  K <- length(unique(y_true))
+  y_pred <- .xgb_argmax(preds, K)
+  acc <- mean(y_pred == y_true)
+  list(metric = "acc", value = acc)
+}
+
+feval_f1_weighted <- function(preds, dtrain) {
+  y_true <- xgboost::getinfo(dtrain, "label")
+  K <- length(unique(y_true))
+  y_pred <- .xgb_argmax(preds, K)
+  tab <- table(factor(y_true, levels = 0:(K-1)),
+               factor(y_pred, levels = 0:(K-1)))
+  tp <- diag(tab)
+  fp <- colSums(tab) - tp
+  fn <- rowSums(tab) - tp
+  prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  support <- rowSums(tab)
+  w <- support / sum(support)
+  list(metric = "f1_weighted", value = sum(w * f1))
+}
+
+# Train final model
 best_nrounds <- cv_result$best_iteration  # use optimal round from CV
+
+params_acc <- params
+params_acc$eval_metric <- "merror"
+
+model_acc <- xgboost::xgb.train(
+  params    = params_acc,
+  data      = dtrain_xg,
+  nrounds   = best_nrounds, 
+  watchlist = list(train = dtrain_xg, test = dtest_xg),
+  callbacks = list(xgboost::cb.evaluation.log()),
+  verbose   = 0
+)
+
+elog_acc <- model_acc$evaluation_log
+last_acc <- nrow(elog_acc)
+train_acc_final <- 1 - elog_acc$train_merror[last_acc]
+
+
+params$eval_metric <- NULL # to use the user defined accuracy and f1 score
 
 xgb_model <- xgb.train(
   params = params,
   data = dtrain_xg,
   nrounds = best_nrounds,
   watchlist = list(train = dtrain_xg, test = dtest_xg),
+  feval = feval_f1_weighted,
+  maximize = TRUE,
+  callbacks = list(xgboost::cb.evaluation.log()),
   verbose = 0
 )
+
+# Log best score from the training
+elog <- xgb_model$evaluation_log
+last <- nrow(elog)
+
+train_f1w_final <- elog$train_f1_weighted[last]
+
+cat(sprintf("[FINAL @ %d rounds]\n", best_nrounds))
+cat(sprintf("Train Accuracy:  %.4f | Train F1_weighted: %.4f\n",
+            train_acc_final, train_f1w_final))
+
 
 # Predict and evaluate on test set
 pred_prob <- predict(xgb_model, newdata = dtest_xg)
@@ -533,8 +598,21 @@ print(conf_matrix_xgb)
 accuracy_xgb <- sum(diag(conf_matrix_xgb)) / sum(conf_matrix_xgb)
 cat("Test Accuracy:", round(accuracy_xgb * 100, 2), "%\n")
 
+# Set level order for Confusion Matrix
+truth_fac <- factor(actual_class_label, levels = severity_levels, ordered = TRUE)
+pred_fac  <- factor(pred_class_label,   levels = severity_levels, ordered = TRUE)
+pred_df <- tibble(truth = truth_fac, estimate = pred_fac)
+
+# Weighted F1
+f1_weighted_xg <- f_meas(pred_df, truth, estimate, estimator = "macro_weighted") %>% dplyr::pull(.estimate)
+cat("Test F1 Score (weighted):", round(f1_weighted_xg * 100, 2), "%\n")
+
 # Plot Confusion Matrix
 conf_df <- as.data.frame(conf_matrix_xgb)
+
+conf_df$Actual <- factor(conf_df$Actual, levels = severity_levels, ordered = TRUE)
+conf_df$Predicted <- factor(conf_df$Predicted, levels = severity_levels, ordered = TRUE)
+
 confusion_matrix_xgboost_plot = ggplot(conf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
   geom_tile(color = "white") +
   geom_text(aes(label = Freq), color = "black", size = 6) +
@@ -559,10 +637,10 @@ dtrain <- xgb.DMatrix(data = X_train_mat, label = y_train_xg)
 # Compute feature importance
 importance_matrix <- xgb.importance(feature_names = colnames(X_train_mat), model = xgb_model)
 
-# Plot top 15 features 
+# Plot top 10 features 
 importance_bar_plot = xgb.plot.importance(
-  importance_matrix[1:min(15, nrow(importance_matrix)), ], 
-  main = "Top 15 Important Features (XGBoost)",
+  importance_matrix[1:min(10, nrow(importance_matrix)), ], 
+  main = "Top 10 Important Features (XGBoost)",
   rel_to_first = TRUE,
   xlab = "Relative Importance"
 )
